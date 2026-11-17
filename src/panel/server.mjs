@@ -166,6 +166,143 @@ function authed(req, url) {
   return crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(token))
 }
 
+// ── 记忆强度（与 qq-bridge/src/mcp-shared-memory.js 同一套口径）──────────
+// 两边必须用同样的 entryId，否则面板钉住的那条，轮转时不认。
+const HALF_LIFE_DAYS = 30
+const INDEX_FILE = () => path.join(config.memoryDir, '.memory-index.json')
+
+function entryId(entry) {
+  const m = /^###\s+(\S+ \S+)([\s\S]*)$/.exec(entry)
+  const stamp = m ? m[1] : ''
+  const body = (m ? m[2] : entry).replace(/\s+/g, ' ').trim().slice(0, 24)
+  return `${stamp}|${body}|${entry.length}`
+}
+
+function readIndex() {
+  try {
+    return JSON.parse(fs.readFileSync(INDEX_FILE(), 'utf8').replace(/^\uFEFF/, '')) || {}
+  } catch {
+    return {}
+  }
+}
+
+function writeIndex(index) {
+  const file = INDEX_FILE()
+  const tmp = `${file}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(index, null, 2) + '\n', 'utf8')
+  fs.renameSync(tmp, file)
+}
+
+function scoreOf(meta, entryTime, now = Date.now()) {
+  const hits = Number(meta?.hits ?? 0)
+  const last = Number(meta?.lastSeen ?? entryTime ?? now)
+  const days = Math.max(0, (now - last) / 86400000)
+  return (1 + hits) * Math.pow(0.5, days / HALF_LIFE_DAYS)
+}
+
+function tierOf(score, pin) {
+  if (pin) return 'important'
+  if (score >= 1.5) return 'important'
+  if (score >= 0.5) return 'normal'
+  return 'fading'
+}
+
+/** 每一条记忆 + 它的强度/档位（面板「记忆」页用）。 */
+function tieredEntries() {
+  const index = readIndex()
+  const now = Date.now()
+  const out = []
+  for (const c of config.channels) {
+    let text = ''
+    try {
+      text = fs.readFileSync(path.join(config.memoryDir, c.file), 'utf8')
+    } catch {
+      continue
+    }
+    for (const e of parseEntries(text)) {
+      const id = entryId(e.text)
+      const meta = index[id] ?? {}
+      const entryTime = Date.parse(`${e.date}T${e.time}`) || now
+      const score = scoreOf(meta, entryTime, now)
+      out.push({
+        id,
+        channel: c.id,
+        channelTitle: c.title,
+        trust: c.trust,
+        writable: c.writable,
+        date: e.date,
+        time: e.time,
+        text: e.text,
+        hits: Number(meta.hits ?? 0),
+        pin: meta.pin === true,
+        score: Number(score.toFixed(3)),
+        tier: tierOf(score, meta.pin === true),
+      })
+    }
+  }
+  return out.sort((a, b) => b.score - a.score)
+}
+
+function interestsPath() {
+  return path.join(config.memoryDir, 'interests.json')
+}
+
+function readInterests() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(interestsPath(), 'utf8').replace(/^\uFEFF/, ''))
+    return {
+      ok: true,
+      topics: Array.isArray(raw.topics) ? raw.topics : [],
+      dailyQuota: raw.dailyQuota ?? null,
+      blocklist: Array.isArray(raw.blocklist) ? raw.blocklist : [],
+      recent: Array.isArray(raw.recent) ? raw.recent.slice(-50) : [],
+    }
+  } catch {
+    return { ok: false, topics: [], dailyQuota: null, blocklist: [], recent: [], hint: '还没有 interests.json' }
+  }
+}
+
+/** 把某条记忆的正文替换掉（保留时间戳与位置）。 */
+function editEntry(channelId, id, nextBody) {
+  const c = config.channels.find((x) => x.id === channelId)
+  if (!c) return { ok: false, error: `没有频道 ${channelId}` }
+  if (!c.writable) return { ok: false, error: '这个频道只读（规则类记忆只能人工编辑文件）' }
+  const p = path.join(config.memoryDir, c.file)
+  const text = fs.readFileSync(p, 'utf8')
+  const entries = parseEntries(text)
+  const target = entries.find((e) => entryId(e.text) === id)
+  if (!target) return { ok: false, error: '没找到这条记忆' }
+  const header = /^###\s+\S+ \S+[^\n]*\n?/.exec(target.text)?.[0] ?? ''
+  const body = String(nextBody ?? '').trim()
+  if (!body) return { ok: false, error: '正文不能为空' }
+  const rebuilt = `${header}\n${body}\n`
+  const backupDir = path.join(config.memoryDir, 'archive')
+  fs.mkdirSync(backupDir, { recursive: true })
+  fs.copyFileSync(p, path.join(backupDir, `${c.file}.${new Date().toISOString().replace(/[:.]/g, '-')}.bak`))
+  fs.writeFileSync(p, text.replace(target.text, rebuilt), 'utf8')
+  return { ok: true, id: entryId(rebuilt), backup: backupDir }
+}
+
+/** 删掉某一条（不是整天）。 */
+function forgetEntry(channelId, id) {
+  const c = config.channels.find((x) => x.id === channelId)
+  if (!c) return { ok: false, error: `没有频道 ${channelId}` }
+  if (!c.writable) return { ok: false, error: '这个频道只读（规则类记忆只能人工编辑文件）' }
+  const p = path.join(config.memoryDir, c.file)
+  const text = fs.readFileSync(p, 'utf8')
+  const entries = parseEntries(text)
+  const target = entries.find((e) => entryId(e.text) === id)
+  if (!target) return { ok: false, error: '没找到这条记忆' }
+  const backupDir = path.join(config.memoryDir, 'archive')
+  fs.mkdirSync(backupDir, { recursive: true })
+  fs.copyFileSync(p, path.join(backupDir, `${c.file}.${new Date().toISOString().replace(/[:.]/g, '-')}.bak`))
+  fs.writeFileSync(p, text.replace(target.text, '').replace(/\n{3,}/g, '\n\n'), 'utf8')
+  const index = readIndex()
+  delete index[id]
+  writeIndex(index)
+  return { ok: true, backup: backupDir }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${port}`)
 
@@ -248,6 +385,46 @@ const server = http.createServer(async (req, res) => {
       const a = adapters.find((x) => x.id === id)
       if (!a) return json(res, 404, { ok: false, error: `没有适配器 ${id}` })
       return json(res, 200, { ok: true, id, title: a.title, trust: a.trust, text: await readAdapter(a) })
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/tiers') {
+      const items = tieredEntries()
+      const counts = { important: 0, normal: 0, fading: 0 }
+      for (const i of items) counts[i.tier] += 1
+      return json(res, 200, { ok: true, counts, items })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/pin') {
+      const body = JSON.parse((await readBody(req)) || '{}')
+      const id = String(body.id ?? '')
+      const want = body.pin !== false
+      const item = tieredEntries().find((x) => x.id === id)
+      if (!item) return json(res, 404, { ok: false, error: '没找到这条记忆' })
+      const index = readIndex()
+      const meta = index[id] ?? { hits: 0, born: Date.now(), channel: item.channel }
+      meta.pin = want
+      meta.channel = item.channel
+      meta.lastSeen = meta.lastSeen ?? Date.now()
+      index[id] = meta
+      writeIndex(index)
+      return json(res, 200, { ok: true, id, pin: want })
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/edit') {
+      const body = JSON.parse((await readBody(req)) || '{}')
+      const result = editEntry(String(body.channel ?? ''), String(body.id ?? ''), String(body.text ?? ''))
+      return json(res, result.ok ? 200 : 400, result)
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/forget') {
+      const body = JSON.parse((await readBody(req)) || '{}')
+      if (body.confirm !== true) return json(res, 400, { ok: false, error: '删除需要 confirm: true' })
+      const result = forgetEntry(String(body.channel ?? ''), String(body.id ?? ''))
+      return json(res, result.ok ? 200 : 400, result)
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/interests') {
+      return json(res, 200, { ok: true, ...readInterests() })
     }
 
     if (req.method === 'POST' && url.pathname === '/api/append') {

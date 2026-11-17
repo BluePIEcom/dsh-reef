@@ -61,6 +61,8 @@
 
 <nav>
   <button data-tab="days" class="on">按天</button>
+  <button data-tab="tiers">记忆</button>
+  <button data-tab="interests">兴趣</button>
   <button data-tab="channels">频道</button>
   <button data-tab="search">搜索</button>
   <button data-tab="digests">摘要</button>
@@ -68,6 +70,16 @@
 </nav>
 
 <main>
+  <section id="tab-tiers" class="hidden">
+    <div class="row" style="margin-bottom:14px">
+      <span class="hint">按记忆强度分三档：常被读到的会浮上来，很久没人看、也没被钉住的会往下掉。可手动挂起（永不淘汰）、改内容、删掉。</span>
+    </div>
+    <div id="tierBody"></div>
+  </section>
+
+  <section id="tab-interests" class="hidden">
+    <div id="interestCard" class="card"><pre>加载中…</pre></div>
+  </section>
   <section id="tab-days">
     <div class="row" style="margin-bottom:14px">
       <span class="hint">每天记了些什么。点一天看详情；删除前会先备份到 archive/。</span>
@@ -137,7 +149,9 @@ const setStatus = (t, bad) => { const el = $('#status'); el.textContent = t; el.
 
 document.querySelectorAll('nav button').forEach((b) => b.addEventListener('click', () => {
   document.querySelectorAll('nav button').forEach((x) => x.classList.toggle('on', x === b));
-  ['days', 'channels', 'search', 'digests', 'append'].forEach((t) => $('#tab-' + t).classList.toggle('hidden', t !== b.dataset.tab));
+  ['days', 'tiers', 'interests', 'channels', 'search', 'digests', 'append'].forEach((t) => $('#tab-' + t).classList.toggle('hidden', t !== b.dataset.tab));
+  if (b.dataset.tab === 'tiers') void loadTiers();
+  if (b.dataset.tab === 'interests') void loadInterests();
 }));
 
 let writable = [];
@@ -266,6 +280,100 @@ $('#doAppend').onclick = async () => {
     if (r.ok) { $('#apText').value = ''; await loadDays(); }
   } catch (e) { $('#apResult').textContent = '✗ ' + e.message; }
 };
+
+// ── 记忆三档 + 挂起/编辑/删除 ──────────────────────────────────
+const TIER_META = {
+  important: { label: '重要', hint: '常被用到，或被挂起 → 轮转时优先保住' },
+  normal: { label: '普通', hint: '正常保留' },
+  fading: { label: '即将淡忘', hint: '很久没被读到 → 下次轮转先删这些' },
+};
+
+function tierCard(i) {
+  const body = i.text.replace(/^### .*\n/, '').trim();
+  return `<div class="card entry ${i.trust}" style="margin:10px 0" data-id="${esc(i.id)}" data-channel="${esc(i.channel)}" data-pin="${i.pin ? 1 : 0}" data-body="${esc(body)}">
+    <div class="meta">${esc(i.date)} ${esc(i.time)} · ${esc(i.channelTitle)} <span class="tag t-${i.trust}">${i.trust}</span>
+      · 读到 ${i.hits} 次 · 强度 ${i.score}${i.pin ? ' · 📌 已挂起' : ''}</div>
+    <pre>${esc(body.slice(0, 700))}</pre>
+    <div class="row" style="margin-top:8px">
+      <button class="act" data-act="pin">${i.pin ? '取消挂起' : '挂起'}</button>
+      ${i.writable
+        ? '<button class="act" data-act="edit">改内容</button><button class="act danger" data-act="forget">删掉</button>'
+        : '<span class="hint">只读频道（规则只能人工编辑文件）</span>'}
+    </div>
+  </div>`;
+}
+
+async function loadTiers() {
+  const box = $('#tierBody');
+  box.innerHTML = '<div class="hint">加载中…</div>';
+  try {
+    const data = await api('/api/tiers');
+    if (!data.items.length) { box.innerHTML = '<div class="hint">还没有任何记忆。</div>'; return; }
+    const parts = [];
+    for (const g of ['important', 'normal', 'fading']) {
+      const items = data.items.filter((i) => i.tier === g);
+      parts.push(`<h3 style="margin:22px 0 8px">${TIER_META[g].label}
+        <span class="count">${items.length} 条 · ${TIER_META[g].hint}</span></h3>`);
+      parts.push(items.length ? items.map(tierCard).join('') : '<div class="hint">（空）</div>');
+    }
+    box.innerHTML = parts.join('');
+  } catch (e) { box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+
+$('#tierBody').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const card = btn.closest('[data-id]');
+  const id = card.dataset.id;
+  const channel = card.dataset.channel;
+  const act = btn.dataset.act;
+  try {
+    if (act === 'pin') {
+      const want = card.dataset.pin !== '1';
+      await api('/api/pin', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, pin: want }) });
+      await loadTiers();
+      setStatus(want ? '已挂起（轮转时不会删）' : '已取消挂起');
+    }
+    if (act === 'edit') {
+      const next = prompt('改这一条的内容：', card.dataset.body);
+      if (next == null) return;
+      await api('/api/edit', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ channel, id, text: next }) });
+      await loadTiers();
+      setStatus('已改，旧版本备份在 archive/');
+    }
+    if (act === 'forget') {
+      if (!confirm('确定删掉这一条？会先备份到 archive/')) return;
+      await api('/api/forget', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ channel, id, confirm: true }) });
+      await loadTiers();
+      setStatus('已删除（可从 archive/ 找回）');
+    }
+  } catch (e) { alert('失败：' + e.message); }
+});
+
+// ── 兴趣卡（她自己找的话题）──────────────────────────────────
+async function loadInterests() {
+  const box = $('#interestCard');
+  box.innerHTML = '<pre>加载中…</pre>';
+  try {
+    const d = await api('/api/interests');
+    if (!d.ok) {
+      box.innerHTML = `<div class="hint">还没有 interests.json。在记忆目录里建一个，例如：</div>
+        <pre>${esc(JSON.stringify({ topics: ['手书', '冷知识', 'AI 绘画'], dailyQuota: { searches: 3, picks: 1 }, blocklist: ['擦边'], recent: [] }, null, 2))}</pre>`;
+      return;
+    }
+    const topics = d.topics.length ? d.topics.map((t) => `<span class="tag t-self">${esc(t)}</span>`).join(' ') : '<span class="hint">（还没设话题）</span>';
+    const quota = d.dailyQuota ? `搜索 ${d.dailyQuota.searches ?? '?'} 次 / 挑 ${d.dailyQuota.picks ?? '?'} 条` : '未设置';
+    const recent = d.recent.length
+      ? d.recent.slice().reverse().map((r) => `<div class="entry"><div class="meta">${esc(r.at ?? '')} · ${esc(r.topic ?? '')}</div><pre>${esc(r.title ?? r.text ?? '')}</pre></div>`).join('')
+      : '<div class="hint" style="margin-top:12px">还没有搜索记录（自检索功能接上后会自动出现在这里）。</div>';
+    box.innerHTML = `
+      <h3 style="margin:0 0 4px">她在自己找的话题</h3>
+      <div class="row" style="margin:10px 0">${topics}</div>
+      <div class="hint">每日额度：${quota}</div>
+      <div class="hint">黑名单：${esc((d.blocklist || []).join('、') || '无')}</div>
+      <h3 style="margin:18px 0 4px">最近搜过</h3>${recent}`;
+  } catch (e) { box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
 
 boot();
 </script>
