@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { createStore, normalizeConfig, TRUST_BANNERS, LIMITS } from '../src/memory.mjs'
+import { createStore, normalizeConfig, TRUST_BANNERS, LIMITS, limitsFor } from '../src/memory.mjs'
 
 function tmpStore(extra = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shared-memory-test-'))
@@ -90,3 +90,50 @@ test('read 对不存在的文件返回说明而不是抛错', () => {
   const text = store.read('self', 10)
   assert.match(text, /还不存在|空的/)
 })
+
+// ── 遗忘曲线 ────────────────────────────────────────────────────
+test('read 会记录命中次数（隐式复习）', () => {
+  const { dir, store } = tmpStore()
+  store.append('self', '这是一条会被反复读到的记录')
+  store.read('self', 50)
+  store.read('self', 50)
+  const index = JSON.parse(fs.readFileSync(path.join(dir, '.memory-index.json'), 'utf8'))
+  const hits = Object.values(index).map((m) => m.hits)
+  assert.equal(hits.length, 1)
+  assert.ok(hits[0] >= 2, `hits=${hits[0]}`)
+})
+
+test('钉住的条目在轮转中幸存，未钉住的被淘汰', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shared-memory-curve-'))
+  const config = normalizeConfig({
+    memoryDir: dir,
+    channels: [
+      { id: 'inbox', file: 'inbox.md', trust: 'untrusted', writable: true, title: '第三方', limits: { maxBytes: 1200, keepBytes: 600 } },
+    ],
+  }, dir)
+  const store = createStore(config)
+  store.append('inbox', `要保住的一条：${'内容'.repeat(20)}`)
+  store.read('inbox', 50)
+  assert.equal(store.pin('要保住的一条').ok, true)
+  for (const n of [1, 2, 3, 4, 5]) store.append('inbox', `普通记录${n}：${'内容'.repeat(20)}`)
+  const text = fs.readFileSync(path.join(dir, 'inbox.md'), 'utf8')
+  assert.match(text, /要保住的一条/)
+  assert.ok(fs.statSync(path.join(dir, 'inbox.md')).size <= 1200, '轮转后仍在限额内')
+})
+
+test('trusted 频道不轮转（哪怕超过限额）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shared-memory-trusted-'))
+  const config = normalizeConfig({
+    memoryDir: dir,
+    channels: [
+      { id: 'owner', file: 'owner.md', trust: 'trusted', writable: false, title: '事实', limits: { maxBytes: 200, keepBytes: 100 } },
+    ],
+  }, dir)
+  const store = createStore(config)
+  fs.writeFileSync(path.join(dir, 'owner.md'), `# 事实\n\n### 2026-11-01 10:00:00 [trusted]\n\n- 规矩：${'很重要'.repeat(50)}\n`)
+  const before = fs.statSync(path.join(dir, 'owner.md')).size
+  assert.ok(before > 200)
+  // 通过公开口径确认：trusted 的 rotate 为 false
+  assert.equal(limitsFor(config.channels[0]).rotate, false)
+})
+

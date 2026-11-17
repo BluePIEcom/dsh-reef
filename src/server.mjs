@@ -126,4 +126,20 @@ server.tool(
   }
 )
 
+server.tool(
+  'memory_pin',
+  '钉住/取消钉住某条记忆（按内容片段匹配）。钉住的条目在文件超限轮转时永不淘汰，用来保住使用者反复强调的事。只影响保留顺序，不影响信任级别。',
+  {
+    match: z.string().describe('内容片段，例如「晚上别发消息」'),
+    pin: z.boolean().optional().describe('true=钉住，false=取消（默认 true）'),
+  },
+  async ({ match, pin }) => {
+    const result = store.pin(match, pin !== false)
+    return {
+      content: [{ type: 'text', text: result.ok ? `已${pin === false ? '取消钉住' : '钉住'} ${result.matched} 条（匹配「${match}」）` : result.error }],
+      isError: !result.ok,
+    }
+  }
+)
+
 await server.connect(new StdioServerTransport())

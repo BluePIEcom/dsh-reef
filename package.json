@@ -1,6 +1,6 @@
 {
   "name": "dsh-reef",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": false,
   "description": "dsh-reef: a shared reef for DSH agents — trust-labeled memory plus on-demand digest tools across plugins.",
   "type": "module",

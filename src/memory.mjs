@@ -32,8 +32,22 @@ export const TRUST_BANNERS = {
 
 export const LIMITS = {
   maxAppendChars: 4000,
-  maxFileBytes: 256 * 1024,
-  keepBytes: 200 * 1024,
+  // 阈值按「读一次要多少 token」定，不按磁盘：中文 1 KB ≈ 270 tokens，
+  // 32 KB 全读 ≈ 8.6k tokens（约占 128k 上下文的 7%）。channel 可用 limits 覆盖。
+  maxFileBytes: 32 * 1024,
+  keepBytes: 24 * 1024,
+  // 记忆强度的半衰期：30 天没人读 → 强度减半
+  halfLifeDays: 30,
+}
+
+/** 某个 channel 实际生效的限额（可被 config 里的 limits 覆盖）。 */
+export function limitsFor(channelConfig) {
+  const lim = channelConfig?.limits ?? {}
+  return {
+    maxBytes: Number(lim.maxBytes ?? LIMITS.maxFileBytes),
+    keepBytes: Number(lim.keepBytes ?? LIMITS.keepBytes),
+    rotate: lim.rotate !== false && channelConfig?.trust !== 'trusted',
+  }
 }
 
 function ensureDir(dir) {
@@ -71,6 +85,7 @@ export function normalizeConfig(raw, baseDir) {
       writable: c.writable === true,
       title: typeof c.title === 'string' && c.title ? c.title : c.file,
       rule: typeof c.rule === 'string' && c.rule ? c.rule : TRUST_BANNERS[c.trust].rule,
+      limits: c.limits && typeof c.limits === 'object' ? c.limits : {},
     }
   })
   if (!channels.length) throw new Error('配置里至少要有一个 channel')
@@ -112,6 +127,10 @@ export function createStore(config) {
     const lines = text.split(/\r?\n/)
     const sliced = tailLines > 0 ? lines.slice(-tailLines) : lines
     const head = sliced.length < lines.length ? `（只显示最后 ${sliced.length} 行，共 ${lines.length} 行）\n` : ''
+    // 隐式"复习"：被读到的条目 hits+1，参与轮转时的保留排序（不影响信任级别）
+    try {
+      touch(id, text)
+    } catch {}
     return head + sliced.join('\n')
   }
 
@@ -142,23 +161,213 @@ export function createStore(config) {
       : `\n### ${stamp} [${TRUST_BANNERS[c.trust].label}]\n${body}\n`
     const p = filePath(c)
     fs.appendFileSync(p, chunk, 'utf8')
-    rotate(p)
+    // 超限裁剪：按记忆强度淘汰（不是单纯丢最旧的）；trusted 频道不轮转
+    const lim = limitsFor(c)
+    if (lim.rotate) {
+      try {
+        if (fs.statSync(p).size > lim.maxBytes) rotateByScore(c)
+      } catch {
+        // 轮转失败不影响主流程
+      }
+    }
     return { ok: true, channel: c.id, file: c.file, appendedChars: body.length }
   }
 
-  /** 超限时保留最近的一段，按行边界切，避免半行。 */
-  function rotate(p) {
+  // ── 记忆强度（遗忘曲线）────────────────────────────────────────
+  // 索引与正文分离：.memory-index.json 不进 prompt、不占 token。
+  //   score = (1 + hits) × 0.5 ^ (距上次被读到的天数 / halfLifeDays)
+  // 边界：频次只影响**保留顺序**，绝不影响信任级别（trusted 由文件决定，且不轮转）。
+  function indexPath() {
+    return path.join(config.memoryDir, '.memory-index.json')
+  }
+
+  function loadIndex() {
     try {
-      if (fs.statSync(p).size <= LIMITS.maxFileBytes) return
-      const buf = fs.readFileSync(p)
-      let cut = buf.length - LIMITS.keepBytes
-      const idx = buf.subarray(cut).indexOf(0x0a)
-      if (idx >= 0) cut += idx + 1
-      fs.writeFileSync(p, buf.subarray(cut))
+      return JSON.parse(fs.readFileSync(indexPath(), 'utf8').replace(/^\uFEFF/, '')) || {}
     } catch {
-      // 轮转失败不影响主流程
+      return {}
     }
   }
 
-  return { config, read, banner, append, channels: config.channels, channel }
+  function saveIndex(index) {
+    const file = indexPath()
+    const tmp = `${file}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(index, null, 2) + '\n', 'utf8')
+    fs.renameSync(tmp, file)
+  }
+
+  /** 条目指纹：时间戳 + 正文前 24 字 + 长度（与面板同一算法，否则钉住对不上）。 */
+  function entryId(entry) {
+    const m = /^###\s+(\S+ \S+)([\s\S]*)$/.exec(entry)
+    const stamp = m ? m[1] : ''
+    const body = (m ? m[2] : entry).replace(/\s+/g, ' ').trim().slice(0, 24)
+    return `${stamp}|${body}|${entry.length}`
+  }
+
+  function splitEntries(text) {
+    return text.split(/(?=^### )/m).filter((p) => p.startsWith('### '))
+  }
+
+  function entryTimeOf(entry) {
+    const m = /^###\s+(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})/.exec(entry)
+    if (!m) return null
+    const t = Date.parse(`${m[1]}T${m[2]}`)
+    return Number.isFinite(t) ? t : null
+  }
+
+  function scoreOf(meta, fallbackTime, now = Date.now()) {
+    const hits = Number(meta?.hits ?? 0)
+    const last = Number(meta?.lastSeen ?? fallbackTime ?? now)
+    const days = Math.max(0, (now - last) / 86400000)
+    return (1 + hits) * Math.pow(0.5, days / LIMITS.halfLifeDays)
+  }
+
+  /** 读到时记一次"复习"。 */
+  function touch(channelId, text) {
+    const entries = splitEntries(text)
+    if (!entries.length) return
+    const index = loadIndex()
+    const now = Date.now()
+    for (const entry of entries) {
+      const id = entryId(entry)
+      const meta = index[id] ?? { hits: 0, born: now, pin: false, channel: channelId }
+      meta.hits = Number(meta.hits ?? 0) + 1
+      meta.lastSeen = now
+      meta.channel = channelId
+      index[id] = meta
+    }
+    saveIndex(index)
+  }
+
+  /** 文件里没有任何 `### ` 条目时，退回按字节裁尾（不认识格式的文件不能被整份删掉）。 */
+  function trimTail(p, keepBytes) {
+    const buf = fs.readFileSync(p)
+    if (buf.length <= keepBytes) return
+    let cut = buf.length - keepBytes
+    const idx = buf.subarray(cut).indexOf(0x0a)
+    if (idx >= 0) cut += idx + 1
+    fs.writeFileSync(p, buf.subarray(cut))
+  }
+
+  /** 超限时按强度从低到高删（钉住的永不淘汰），直到回到 keepBytes 以内。 */
+  function rotateByScore(c) {
+    const lim = limitsFor(c)
+    const p = filePath(c)
+    const text = fs.readFileSync(p, 'utf8')
+    const entries = splitEntries(text)
+    if (!entries.length) {
+      trimTail(p, lim.keepBytes)
+      return
+    }
+    const index = loadIndex()
+    const now = Date.now()
+    let items = entries.map((entry) => {
+      const id = entryId(entry)
+      const meta = index[id] ?? {}
+      return {
+        entry,
+        id,
+        meta,
+        pinned: meta.pin === true,
+        score: scoreOf(meta, entryTimeOf(entry), now),
+        bytes: Buffer.byteLength(entry, 'utf8'),
+      }
+    })
+    const firstIndex = text.search(/^### /m)
+    const preamble = firstIndex > 0 ? text.slice(0, firstIndex).replace(/\s*$/, '') : ''
+    let total = items.reduce((n, i) => n + i.bytes, 0) + Buffer.byteLength(preamble, 'utf8')
+
+    while (total > lim.keepBytes && items.length > 1) {
+      const pool = items.filter((i) => !i.pinned)
+      if (!pool.length) break // 全被钉住 → 不删，宁可暂时超限
+      pool.sort((a, b) => a.score - b.score)
+      const victim = pool[0]
+      items = items.filter((i) => i !== victim)
+      total -= victim.bytes
+    }
+
+    // 条目删到只剩一条还不够小（通常是上面那段不属于任何条目的长文本），
+    // 就从**前言**里按行裁掉最旧的部分，条目本身一条不动。
+    let head = preamble
+    if (total > lim.keepBytes && head) {
+      let excess = total - lim.keepBytes
+      const headLines = head.split('\n')
+      while (excess > 0 && headLines.length > 1) {
+        excess -= Buffer.byteLength(headLines.shift() + '\n', 'utf8')
+      }
+      head = headLines.join('\n')
+    }
+
+    fs.writeFileSync(p, `${head}\n\n${items.map((i) => i.entry).join('')}`, 'utf8')
+    const alive = new Set(items.map((i) => i.id))
+    for (const id of Object.keys(index)) if (!alive.has(id)) delete index[id]
+    saveIndex(index)
+  }
+
+  /** 面板/工具用：每条记忆的强度与档位。 */
+  function tiers() {
+    const index = loadIndex()
+    const now = Date.now()
+    const out = []
+    for (const c of config.channels) {
+      let text = ''
+      try {
+        text = fs.readFileSync(filePath(c), 'utf8')
+      } catch {
+        continue
+      }
+      for (const entry of splitEntries(text)) {
+        const id = entryId(entry)
+        const meta = index[id] ?? {}
+        const score = scoreOf(meta, entryTimeOf(entry), now)
+        out.push({
+          id,
+          channel: c.id,
+          trust: c.trust,
+          writable: c.writable,
+          text: entry,
+          hits: Number(meta.hits ?? 0),
+          pin: meta.pin === true,
+          score: Number(score.toFixed(3)),
+          tier: meta.pin === true || score >= 1.5 ? 'important' : score >= 0.5 ? 'normal' : 'fading',
+        })
+      }
+    }
+    return out.sort((a, b) => b.score - a.score)
+  }
+
+  /** 钉住/取消钉住（按内容片段匹配）；只影响保留顺序。 */
+  function pin(match, value = true) {
+    const needle = String(match ?? '').trim()
+    if (!needle) return { ok: false, error: 'match 不能为空' }
+    const index = loadIndex()
+    const now = Date.now()
+    let hit = 0
+    for (const [id, meta] of Object.entries(index)) {
+      if (!id.includes(needle.slice(0, 24))) continue
+      meta.pin = value !== false
+      meta.lastSeen = meta.lastSeen ?? now
+      hit += 1
+    }
+    if (!hit) {
+      for (const c of config.channels) {
+        let text = ''
+        try {
+          text = fs.readFileSync(filePath(c), 'utf8')
+        } catch {
+          continue
+        }
+        for (const entry of splitEntries(text)) {
+          if (!entry.includes(needle)) continue
+          const id = entryId(entry)
+          index[id] = { ...(index[id] ?? { hits: 0, born: now }), channel: c.id, pin: value !== false, lastSeen: now }
+          hit += 1
+        }
+      }
+    }
+    saveIndex(index)
+    return { ok: hit > 0, matched: hit, error: hit ? undefined : `没有匹配到「${needle}」` }
+  }
+
+  return { config, read, banner, append, channels: config.channels, channel, tiers, pin, indexPath }
 }
